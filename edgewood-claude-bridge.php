@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: Edgewood Claude Bridge
- * Description: Lets Claude Code manage this site's Divi pages, templates and settings through the WordPress API. Works only for the "claude" user. Every change is logged under Tools > Claude Bridge.
- * Version: 0.2.0
+ * Description: Lets Claude manage this site's Divi pages, templates and settings through the WordPress API: the "claude" user, plus invited administrators signed in through the Edgewood connector as themselves. Every change is logged under Tools > Claude Bridge.
+ * Version: 0.3.0
  * Author: Edgewood Community Church
  * Requires at least: 6.4
  * Requires PHP: 7.4
@@ -11,7 +11,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-const ECB_VERSION = '0.2.0';
+const ECB_VERSION = '0.3.0';
 const ECB_USER = 'claude';
 const ECB_NS = 'ecb/v1';
 const ECB_LOG_MAX = 300;
@@ -35,16 +35,75 @@ add_filter('rest_authentication_errors', function ($result) {
 }, 100);
 
 function ecb_permission() {
-	return ecb_is_claude() && ecb_enabled() && current_user_can('manage_options');
+	$u = wp_get_current_user();
+	return $u->exists() && ecb_enabled() && (ecb_is_claude() || ecb_person_on($u->ID)) && current_user_can('manage_options');
 }
+
+/* ---------- people: invited administrators who use their own Claude through the Edgewood connector ---------- */
+
+// Admins switched on under Tools > Claude Bridge. Stored as [user id => true].
+function ecb_person_on($id) {
+	$people = get_option('ecb_people', []);
+	return !empty($people[$id]) && user_can($id, 'manage_options');
+}
+
+// The connector (a small helper on Cloudflare) signs in each person with their Edgewood Microsoft account, then
+// sends requests that say who the person is, signed with a key only it and this site know. Headers:
+//   X-ECB-Person: email   X-ECB-Time: unix seconds   X-ECB-Signature: hex HMAC-SHA256(key, "time\nemail\nMETHOD\nrequest URI\nsha256(body)")
+// Media uploads must send the file as the raw body (not a multipart form), so the body hash covers it.
+// A valid request runs as that person's own WordPress account. Only the bridge routes and media uploads accept it,
+// so the key can never reach users, plugins or any other part of WordPress.
+// ponytail: a captured request could be replayed for 5 minutes; HTTPS makes capture unlikely. Add a used-signature list if that changes.
+function ecb_helper_user() {
+	if (empty($_SERVER['HTTP_X_ECB_PERSON'])) return null;
+	$fail = function ($msg) { $GLOBALS['ecb_helper_error'] = new WP_Error('ecb_helper', $msg, ['status' => 401]); return null; };
+	$key = get_option('ecb_helper_key', '');
+	if (strlen($key) < 32) return $fail('The Edgewood connector is not set up on this site yet (Tools > Claude Bridge).');
+	$uri = $_SERVER['REQUEST_URI'] ?? '';
+	// The route must START the address after /wp-json (no ?rest_route= form), so nothing else can borrow the key.
+	$path = rawurldecode((string) parse_url($uri, PHP_URL_PATH));
+	if (strpos($path, '/.') !== false || !preg_match('#^(/[^/]+)*?/wp-json/(ecb/v1|wp/v2/media)(/|$)#', $path)) return $fail('The connector can only use the bridge and media routes.');
+	$email = strtolower(trim($_SERVER['HTTP_X_ECB_PERSON']));
+	$time = (int) ($_SERVER['HTTP_X_ECB_TIME'] ?? 0);
+	if (abs(time() - $time) > 300) return $fail('Request is too old. Check the connector clock.');
+	$body = (string) file_get_contents('php://input');
+	$msg = $time . "\n" . $email . "\n" . strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET') . "\n" . $uri . "\n" . hash('sha256', $body);
+	if (!hash_equals(hash_hmac('sha256', $msg, $key), strtolower((string) ($_SERVER['HTTP_X_ECB_SIGNATURE'] ?? '')))) return $fail('Bad connector signature.');
+	$user = get_user_by('email', $email);
+	if (!$user) return $fail("No WordPress account uses $email.");
+	if (!ecb_person_on($user->ID)) return $fail('This person is not switched on under Tools > Claude Bridge, or is not an administrator.');
+	$GLOBALS['ecb_via_helper'] = true;
+	return $user;
+}
+
+// Runs after WordPress's own sign-ins (application passwords run at 20). A request with a password never reaches this.
+add_filter('determine_current_user', function ($id) {
+	if ($id) return $id;
+	$user = ecb_helper_user();
+	return $user ? $user->ID : $id;
+}, 30);
+
+add_filter('rest_authentication_errors', function ($result) {
+	wp_get_current_user(); // make sure the connector check above has run
+	if (!empty($GLOBALS['ecb_helper_error'])) return $GLOBALS['ecb_helper_error'];
+	if (!empty($GLOBALS['ecb_via_helper']) && !ecb_enabled()) return new WP_Error('ecb_disabled', 'Claude access is turned off in Tools > Claude Bridge.', ['status' => 403]);
+	return $result;
+}, 101);
+
+// Second lock: check the route WordPress actually runs, in case the web server rewrote the address.
+add_filter('rest_pre_dispatch', function ($result, $server, $request) {
+	if (empty($GLOBALS['ecb_via_helper']) || preg_match('#^/(ecb/v1|wp/v2/media)(/|$)#', $request->get_route())) return $result;
+	return new WP_Error('ecb_helper', 'The connector can only use the bridge and media routes.', ['status' => 403]);
+}, 10, 3);
 
 /* ---------- change log: every write Claude makes through any API route ---------- */
 
 add_filter('rest_post_dispatch', function ($response, $server, $request) {
-	if ($request->get_method() === 'GET' || !ecb_is_claude()) return $response;
+	if ($request->get_method() === 'GET' || !(ecb_is_claude() || !empty($GLOBALS['ecb_via_helper']))) return $response;
 	$log = get_option('ecb_log', []);
 	$log[] = [
 		'time'   => current_time('mysql'),
+		'who'    => wp_get_current_user()->display_name,
 		'method' => $request->get_method(),
 		'route'  => $request->get_route(),
 		'status' => $response instanceof WP_HTTP_Response ? $response->get_status() : 0,
@@ -107,6 +166,8 @@ function ecb_status() {
 	}
 	return [
 		'bridge'      => ECB_VERSION,
+		'you'         => wp_get_current_user()->user_login,
+		'viaConnector'=> !empty($GLOBALS['ecb_via_helper']),
 		'wordpress'   => get_bloginfo('version'),
 		'php'         => PHP_VERSION,
 		'theme'       => $theme->get('Name') . ' ' . $theme->get('Version'),
@@ -332,6 +393,16 @@ function ecb_admin_page() {
 	if (isset($_POST['ecb_toggle']) && check_admin_referer('ecb_toggle')) {
 		update_option('ecb_enabled', ecb_enabled() ? '0' : '1', false);
 	}
+	if (isset($_POST['ecb_people_save']) && check_admin_referer('ecb_people')) {
+		$on = [];
+		foreach ((array) ($_POST['ecb_people'] ?? []) as $id) if (user_can((int) $id, 'manage_options')) $on[(int) $id] = true;
+		update_option('ecb_people', $on, false);
+	}
+	if (isset($_POST['ecb_key_save']) && check_admin_referer('ecb_key')) {
+		$key = trim((string) wp_unslash($_POST['ecb_key'] ?? ''));
+		if ($key === '' || preg_match('/^[a-f0-9]{64}$/', $key)) update_option('ecb_helper_key', $key, false);
+		else echo '<div class="notice notice-error"><p>That key is not the right shape (64 letters and numbers, a to f and 0 to 9). Nothing was saved.</p></div>';
+	}
 	$check = null;
 	if (isset($_POST['ecb_check']) && check_admin_referer('ecb_check')) $check = ecb_check_now();
 	$on = ecb_enabled();
@@ -343,21 +414,44 @@ function ecb_admin_page() {
 			: 'You have the latest version (' . $check['installed'] . ').');
 		echo '<div class="notice notice-info"><p>' . wp_kses($msg, ['a' => ['href' => []]]) . '</p></div>';
 	}
-	echo '<p>Lets Claude Code edit this site as the <strong>' . esc_html(ECB_USER) . '</strong> user. Version ' . esc_html(ECB_VERSION) . '.</p>';
+	echo '<p>Lets Claude edit this site as the <strong>' . esc_html(ECB_USER) . '</strong> user, and lets the people checked below use their own Claude. Version ' . esc_html(ECB_VERSION) . '.</p>';
 	echo '<p>Claude access is <strong style="color:' . ($on ? '#276838">ON' : '#b32d2e">OFF') . '</strong>.</p>';
 	echo '<form method="post">';
 	wp_nonce_field('ecb_toggle');
 	submit_button($on ? 'Turn Claude access off' : 'Turn Claude access on', $on ? 'secondary' : 'primary', 'ecb_toggle', false);
-	echo '</form><p>To cut Claude off for good, delete its Application Password under Users &gt; ' . esc_html(ECB_USER) . '.</p>';
+	echo '</form><p>This switch covers everyone: the ' . esc_html(ECB_USER) . ' user and every person below. To cut the ' . esc_html(ECB_USER) . ' user off for good, delete its Application Password under Users &gt; ' . esc_html(ECB_USER) . '.</p>';
+
+	echo '<h2>People who can use their own Claude</h2><p>Administrators only. A checked person can edit the site from Claude through the Edgewood connector, signed in with their Edgewood Microsoft account. Changes run as their own WordPress account and show their name in the log below. Their Microsoft email must match the email on their WordPress account.</p>';
+	echo '<form method="post">';
+	wp_nonce_field('ecb_people');
+	$people = get_option('ecb_people', []);
+	echo '<table class="widefat striped" style="max-width:640px"><thead><tr><th>Can use Claude</th><th>Name</th><th>Email</th></tr></thead><tbody>';
+	foreach (get_users(['role' => 'administrator', 'orderby' => 'display_name']) as $u) {
+		if ($u->user_login === ECB_USER) continue;
+		printf('<tr><td><input type="checkbox" name="ecb_people[]" value="%d" %s></td><td>%s</td><td>%s</td></tr>',
+			$u->ID, checked(!empty($people[$u->ID]), true, false), esc_html($u->display_name), esc_html($u->user_email));
+	}
+	echo '</tbody></table>';
+	submit_button('Save people', 'primary', 'ecb_people_save');
+	echo '</form>';
+
+	$key = get_option('ecb_helper_key', '');
+	echo '<h2>Connector key</h2><p>The secret the Edgewood connector uses to prove a request came from it. Status: <strong>'
+		. ($key ? 'saved (ends in ' . esc_html(substr($key, -4)) . ')' : 'not set, so the connector cannot reach this site') . '</strong>. Paste a new key to replace it, or save an empty box to shut the connector out.</p>';
+	echo '<form method="post">';
+	wp_nonce_field('ecb_key');
+	echo '<input type="password" name="ecb_key" autocomplete="off" style="width:36em" placeholder="Paste the key here">';
+	submit_button('Save key', 'secondary', 'ecb_key_save', false);
+	echo '</form>';
 	echo '<h2>Updates</h2><p>WordPress checks GitHub about twice a day. To check right now:</p><form method="post">';
 	wp_nonce_field('ecb_check');
 	submit_button('Check for updates now', 'secondary', 'ecb_check', false);
 	echo '</form>';
-	echo '<h2>Recent changes by Claude</h2><table class="widefat striped"><thead><tr><th>When</th><th>Action</th><th>What</th><th>Result</th></tr></thead><tbody>';
-	if (!$log) echo '<tr><td colspan="4">No changes yet.</td></tr>';
+	echo '<h2>Recent changes by Claude</h2><table class="widefat striped"><thead><tr><th>When</th><th>Who</th><th>Action</th><th>What</th><th>Result</th></tr></thead><tbody>';
+	if (!$log) echo '<tr><td colspan="5">No changes yet.</td></tr>';
 	foreach (array_slice($log, 0, 100) as $e) {
-		printf('<tr><td>%s</td><td>%s</td><td><code>%s</code></td><td>%s</td></tr>',
-			esc_html($e['time']), esc_html($e['method']), esc_html($e['route']), esc_html($e['status']));
+		printf('<tr><td>%s</td><td>%s</td><td>%s</td><td><code>%s</code></td><td>%s</td></tr>',
+			esc_html($e['time']), esc_html($e['who'] ?? ECB_USER), esc_html($e['method']), esc_html($e['route']), esc_html($e['status']));
 	}
 	echo '</tbody></table></div>';
 }
