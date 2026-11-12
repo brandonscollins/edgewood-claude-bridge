@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Edgewood Claude Bridge
  * Description: Lets Claude Code manage this site's Divi pages, templates and settings through the WordPress API. Works only for the "claude" user. Every change is logged under Tools > Claude Bridge.
- * Version: 0.1.1
+ * Version: 0.2.0
  * Author: Edgewood Community Church
  * Requires at least: 6.4
  * Requires PHP: 7.4
@@ -11,10 +11,11 @@
 
 if (!defined('ABSPATH')) exit;
 
-const ECB_VERSION = '0.1.1';
+const ECB_VERSION = '0.2.0';
 const ECB_USER = 'claude';
 const ECB_NS = 'ecb/v1';
 const ECB_LOG_MAX = 300;
+const ECB_REPO = 'brandonscollins/edgewood-claude-bridge';
 
 /* ---------- who is Claude, and is the bridge on ---------- */
 
@@ -91,6 +92,8 @@ add_action('rest_api_init', function () {
 		['methods' => 'DELETE', 'callback' => 'ecb_item_trash', 'permission_callback' => $p],
 	]);
 	register_rest_route(ECB_NS, '/cache/clear', ['methods' => 'POST', 'callback' => 'ecb_cache_clear', 'permission_callback' => $p]);
+	// Lets Claude make WordPress notice a new release right away; installing it still takes an admin's click.
+	register_rest_route(ECB_NS, '/update-check', ['methods' => 'POST', 'callback' => 'ecb_check_now', 'permission_callback' => $p]);
 });
 
 function ecb_status() {
@@ -259,6 +262,65 @@ function ecb_cache_clear() {
 	return ['cleared' => $done];
 }
 
+/* ---------- updates from GitHub (shown on the Plugins page; an admin clicks "Update now") ---------- */
+
+// Each GitHub release carries version.json and edgewood-claude-bridge.zip. Using github.com download
+// links instead of the GitHub API avoids its per-server rate limit on shared hosting.
+function ecb_latest_release($force = false) {
+	$cached = get_site_transient('ecb_release');
+	if (!$force && empty($_GET['force-check']) && is_array($cached)) return $cached;
+	$res = wp_remote_get('https://github.com/' . ECB_REPO . '/releases/latest/download/version.json', ['timeout' => 10]);
+	$data = json_decode(wp_remote_retrieve_body($res), true);
+	if (is_wp_error($res) || wp_remote_retrieve_response_code($res) !== 200 || empty($data['version'])) return null;
+	$release = [
+		'version' => (string) $data['version'],
+		'notes'   => (string) ($data['notes'] ?? ''),
+		'package' => 'https://github.com/' . ECB_REPO . '/releases/download/v' . rawurlencode($data['version']) . '/edgewood-claude-bridge.zip',
+	];
+	set_site_transient('ecb_release', $release, HOUR_IN_SECONDS);
+	return $release;
+}
+
+add_filter('pre_set_site_transient_update_plugins', function ($transient) {
+	if (!is_object($transient)) return $transient;
+	$release = ecb_latest_release();
+	if (!$release) return $transient;
+	$file = plugin_basename(__FILE__);
+	$item = (object) ['slug' => 'edgewood-claude-bridge', 'plugin' => $file, 'new_version' => $release['version'],
+		'package' => $release['package'], 'url' => 'https://github.com/' . ECB_REPO];
+	if (version_compare($release['version'], ECB_VERSION, '>')) {
+		$transient->response[$file] = $item;
+		unset($transient->no_update[$file]);
+	} else {
+		$transient->no_update[$file] = $item;
+		unset($transient->response[$file]);
+	}
+	return $transient;
+});
+
+// "View details" on the Plugins page.
+add_filter('plugins_api', function ($result, $action, $args) {
+	if ($action !== 'plugin_information' || ($args->slug ?? '') !== 'edgewood-claude-bridge') return $result;
+	$release = ecb_latest_release() ?: ['version' => ECB_VERSION, 'notes' => '', 'package' => ''];
+	return (object) ['name' => 'Edgewood Claude Bridge', 'slug' => 'edgewood-claude-bridge', 'version' => $release['version'],
+		'download_link' => $release['package'], 'homepage' => 'https://github.com/' . ECB_REPO,
+		'sections' => ['changelog' => nl2br(esc_html($release['notes'] ?: 'See GitHub for release notes.'))]];
+}, 10, 3);
+
+function ecb_check_now() {
+	delete_site_transient('ecb_release');
+	delete_site_transient('update_plugins');
+	wp_update_plugins();
+	$release = ecb_latest_release();
+	return ['installed' => ECB_VERSION, 'latest' => $release['version'] ?? null,
+		'update_available' => $release && version_compare($release['version'], ECB_VERSION, '>')];
+}
+
+add_filter('plugin_action_links_' . plugin_basename(__FILE__), function ($links) {
+	$links[] = '<a href="' . esc_url(admin_url('tools.php?page=ecb')) . '">Settings and update check</a>';
+	return $links;
+});
+
 /* ---------- Tools > Claude Bridge: on/off switch and change log ---------- */
 
 add_action('admin_menu', function () {
@@ -270,15 +332,27 @@ function ecb_admin_page() {
 	if (isset($_POST['ecb_toggle']) && check_admin_referer('ecb_toggle')) {
 		update_option('ecb_enabled', ecb_enabled() ? '0' : '1', false);
 	}
+	$check = null;
+	if (isset($_POST['ecb_check']) && check_admin_referer('ecb_check')) $check = ecb_check_now();
 	$on = ecb_enabled();
 	$log = array_reverse(get_option('ecb_log', []));
 	echo '<div class="wrap"><h1>Claude Bridge</h1>';
+	if ($check) {
+		$msg = $check['latest'] === null ? 'Could not reach GitHub. Try again in a minute.'
+			: ($check['update_available'] ? 'Version ' . $check['latest'] . ' is available. <a href="' . esc_url(admin_url('plugins.php')) . '">Go to Plugins and click "Update now"</a>.'
+			: 'You have the latest version (' . $check['installed'] . ').');
+		echo '<div class="notice notice-info"><p>' . wp_kses($msg, ['a' => ['href' => []]]) . '</p></div>';
+	}
 	echo '<p>Lets Claude Code edit this site as the <strong>' . esc_html(ECB_USER) . '</strong> user. Version ' . esc_html(ECB_VERSION) . '.</p>';
 	echo '<p>Claude access is <strong style="color:' . ($on ? '#276838">ON' : '#b32d2e">OFF') . '</strong>.</p>';
 	echo '<form method="post">';
 	wp_nonce_field('ecb_toggle');
 	submit_button($on ? 'Turn Claude access off' : 'Turn Claude access on', $on ? 'secondary' : 'primary', 'ecb_toggle', false);
 	echo '</form><p>To cut Claude off for good, delete its Application Password under Users &gt; ' . esc_html(ECB_USER) . '.</p>';
+	echo '<h2>Updates</h2><p>WordPress checks GitHub about twice a day. To check right now:</p><form method="post">';
+	wp_nonce_field('ecb_check');
+	submit_button('Check for updates now', 'secondary', 'ecb_check', false);
+	echo '</form>';
 	echo '<h2>Recent changes by Claude</h2><table class="widefat striped"><thead><tr><th>When</th><th>Action</th><th>What</th><th>Result</th></tr></thead><tbody>';
 	if (!$log) echo '<tr><td colspan="4">No changes yet.</td></tr>';
 	foreach (array_slice($log, 0, 100) as $e) {
