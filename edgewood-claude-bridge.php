@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Edgewood Claude Bridge
  * Description: Lets Claude Code manage this site's Divi pages, templates and settings through the WordPress API. Works only for the "claude" user. Every change is logged under Tools > Claude Bridge.
- * Version: 0.1.0
+ * Version: 0.1.1
  * Author: Edgewood Community Church
  * Requires at least: 6.4
  * Requires PHP: 7.4
@@ -11,7 +11,7 @@
 
 if (!defined('ABSPATH')) exit;
 
-const ECB_VERSION = '0.1.0';
+const ECB_VERSION = '0.1.1';
 const ECB_USER = 'claude';
 const ECB_NS = 'ecb/v1';
 const ECB_LOG_MAX = 300;
@@ -68,7 +68,7 @@ function ecb_meta_key_allowed($key) {
 function ecb_option_allowed($name) {
 	if (!preg_match('/^(et_|et-|builder_|divi_)/', $name)) return false;
 	// Never expose license keys or account details.
-	return !preg_match('/api_key|license|updates_options|username|password|token/i', $name);
+	return !preg_match('/api_key|google_api|license|updates_options|username|password|token|secret/i', $name);
 }
 
 /* ---------- routes ---------- */
@@ -217,19 +217,24 @@ function ecb_item_save(WP_REST_Request $r) {
 		return new WP_Error('ecb_bad', 'Status must be publish, draft, private or pending.', ['status' => 400]);
 	}
 	if (!$id && empty($data['post_status'])) $data['post_status'] = 'draft';
+	// Check everything before writing anything, so a refused request changes nothing.
+	foreach (array_keys((array) ($b['meta'] ?? [])) as $key) {
+		if (!ecb_meta_key_allowed($key)) return new WP_Error('ecb_forbidden', "Meta key $key is not allowed.", ['status' => 403]);
+	}
+	foreach (array_keys((array) ($b['terms'] ?? [])) as $tax) {
+		if (!is_object_in_taxonomy($type, $tax)) return new WP_Error('ecb_bad', "Taxonomy $tax does not apply here.", ['status' => 400]);
+	}
 	// wp_insert_post strips one level of slashes; Divi content is full of them, so add one first.
 	$result = $id ? wp_update_post(wp_slash($data), true) : wp_insert_post(wp_slash($data), true);
 	if (is_wp_error($result)) return $result;
 
 	if (isset($b['template'])) update_post_meta($result, '_wp_page_template', sanitize_text_field($b['template']));
 	foreach ((array) ($b['meta'] ?? []) as $key => $value) {
-		if (!ecb_meta_key_allowed($key)) return new WP_Error('ecb_forbidden', "Meta key $key is not allowed.", ['status' => 403]);
 		if ($value === null) delete_post_meta($result, $key);
 		else update_post_meta($result, $key, wp_slash($value));
 	}
 	foreach ((array) ($b['terms'] ?? []) as $tax => $slugs) {
-		if (!is_object_in_taxonomy($type, $tax)) return new WP_Error('ecb_bad', "Taxonomy $tax does not apply here.", ['status' => 400]);
-		$set = wp_set_object_terms($result, (array) $slugs, $tax);
+		$set =wp_set_object_terms($result, (array) $slugs, $tax);
 		if (is_wp_error($set)) return $set;
 	}
 	$r2 = new WP_REST_Request('GET');
